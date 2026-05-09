@@ -1,0 +1,16 @@
+outputs/
+.venv/
+__pycache__/
+wandb/
+*.pyc
+*.json
+*.txt
+*.log
+*.ckpt
+*.pt
+*.pth
+*.zip
+*.tar.gz
+*.tar
+*.json
+

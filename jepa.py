@@ -151,3 +151,42 @@ class JEPA(nn.Module):
         cost = self.criterion(info_dict)
         
         return cost
+
+
+class MultiViewJEPA(JEPA):
+    """LeWM with N independent camera views.
+
+    Each view gets its own ViT CLS token (shared encoder weights).
+    The N tokens are concatenated → projected to a single embed_dim space.
+    Everything else (predictor, rollout, planning) is identical to JEPA.
+
+    projector must accept  input_dim = n_views * encoder.hidden_size
+                           output_dim = embed_dim
+    """
+
+    def __init__(self, camera_keys: list[str], **kwargs):
+        super().__init__(**kwargs)
+        self.camera_keys = camera_keys   # e.g. ['pixels_0','pixels_1','pixels_2']
+
+    def encode(self, info: dict) -> dict:
+        """Encode N camera views, concat CLS tokens, project to shared space."""
+        b = info[self.camera_keys[0]].size(0)
+        t = info[self.camera_keys[0]].size(1)
+
+        cls_tokens = []
+        for key in self.camera_keys:
+            pixels = info[key].float()                          # (B, T, C, H, W)
+            pixels = rearrange(pixels, "b t ... -> (b t) ...")  # (B*T, C, H, W)
+            out = self.encoder(pixels, interpolate_pos_encoding=True)
+            cls = out.last_hidden_state[:, 0]                  # (B*T, hidden_dim)
+            cls_tokens.append(cls)
+
+        # (B*T, N * hidden_dim)  →  project  →  (B*T, embed_dim)
+        multi = torch.cat(cls_tokens, dim=-1)
+        emb = self.projector(multi)
+        info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b, t=t)
+
+        if "action" in info:
+            info["act_emb"] = self.action_encoder(info["action"])
+
+        return info
