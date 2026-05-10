@@ -117,64 +117,81 @@ def _project_l1_per_substep(action_raw: torch.Tensor, radius: float = 0.075) -> 
 
 @torch.no_grad()
 def _cem_plan(
-    ctx_emb:    torch.Tensor,   # (1, 3, D)
-    past_act:   torch.Tensor,   # (1, 2, 35) normalised
-    goal_emb:   torch.Tensor,   # (1, 1, D)
-    n_samples:  int = 800,
-    n_elites:   int = 64,
-    n_iters:    int = 10,
-    l1_radius:  float = 0.075,
+    ctx_emb:   torch.Tensor,   # (1, 3, D)
+    past_act:  torch.Tensor,   # (1, 2, 35) normalised
+    goal_emb:  torch.Tensor,   # (1, 1, D)
+    horizon:   int   = 4,
+    n_samples: int   = 800,
+    n_elites:  int   = 64,
+    n_iters:   int   = 10,
+    l1_radius: float = 0.075,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    CEM planner matching V-JEPA 2 AC settings:
-      800 samples, 10 iterations, L1-ball constraint r=0.075 per sub-step.
+    Multi-step CEM planner (horizon=4 obs-steps ≈ 1.33s lookahead).
+    Samples (N, H, 35) action sequences, rolls out H steps autoregressively,
+    minimises MSE between final predicted embedding and goal embedding.
 
     Returns:
-        action_norm (35,) – normalised action (for storing in history)
-        action_raw  (35,) – L1-projected denormalised deltas to send to robot
+        action_norm (35,) – normalised first-step action (stored in history)
+        action_raw  (35,) – L1-projected denormalised first-step action for robot
     """
-    mu    = torch.zeros(ACTION_DIM, device=device)
-    sigma = torch.ones(ACTION_DIM, device=device)
+    # CEM distribution over (horizon, 35) action sequences
+    mu    = torch.zeros(horizon, ACTION_DIM, device=device)
+    sigma = torch.ones(horizon, ACTION_DIM, device=device)
 
-    goal_exp = goal_emb.expand(n_samples, -1, -1)   # (N, 1, D)
-    # Pre-encode past actions once (same for all candidates)
-    past_emb = model.action_encoder(past_act.expand(n_samples, -1, -1))  # (N, 2, D)
+    goal_exp     = goal_emb.expand(n_samples, -1, -1)              # (N, 1, D)
+    past_act_exp = past_act.expand(n_samples, -1, -1)              # (N, 2, 35)
 
     for _ in range(n_iters):
-        # Sample (N, 35) in normalised space, then denormalise + L1-project
-        cands_norm = mu + sigma * torch.randn(n_samples, ACTION_DIM, device=device)
-        cands_raw  = cands_norm * _DELTA_STD + _DELTA_MEAN        # (N, 35) raw
-        cands_raw  = _project_l1_per_substep(cands_raw, l1_radius)
-        # Re-normalise projected raw actions so action_encoder sees consistent input
-        cands_norm = (cands_raw - _DELTA_MEAN) / _DELTA_STD       # (N, 35) normalised
+        # ── 1. Sample & constrain action sequences ──────────────────────────
+        # (N, H, 35) in normalised space
+        cands_norm = mu + sigma * torch.randn(n_samples, horizon, ACTION_DIM, device=device)
 
-        # Encode candidate actions: (N, 1, 35) → (N, 1, D)
-        cand_emb = model.action_encoder(cands_norm.unsqueeze(1))   # (N, 1, D)
+        # Denormalise → L1-project each sub-step → re-normalise
+        cands_raw = cands_norm * _DELTA_STD + _DELTA_MEAN          # (N, H, 35)
+        cands_raw = _project_l1_per_substep(
+            cands_raw.reshape(n_samples * horizon, ACTION_DIM), l1_radius
+        ).reshape(n_samples, horizon, ACTION_DIM)
+        cands_norm = (cands_raw - _DELTA_MEAN) / _DELTA_STD        # (N, H, 35)
 
-        # Full action context [a_{t-2}, a_{t-1}, a_candidate]: (N, 3, D)
-        ctx_act  = torch.cat([past_emb, cand_emb], dim=1)         # (N, 3, D)
+        # ── 2. Encode all H steps at once ───────────────────────────────────
+        # (N, H, 35) → (N, H, D)
+        all_act_emb = model.action_encoder(cands_norm)
 
-        # Predict next embedding
-        ctx_exp  = ctx_emb.expand(n_samples, -1, -1)              # (N, 3, D)
-        pred     = model.predict(ctx_exp, ctx_act)                 # (N, 3, D)
-        next_emb = pred[:, -1:]                                    # (N, 1, D)
+        # ── 3. Autoregressive rollout over H steps ───────────────────────────
+        # emb_seq starts as obs history; act_seq starts as past executed actions
+        emb_seq = ctx_emb.expand(n_samples, -1, -1).clone()        # (N, 3, D)
+        act_seq = model.action_encoder(past_act_exp)                # (N, 2, D)
 
-        # Cost = MSE to goal embedding
-        costs = F.mse_loss(next_emb, goal_exp.detach(), reduction="none") \
-                  .sum(dim=-1).squeeze(-1)                         # (N,)
+        for h in range(horizon):
+            ctx_e = emb_seq[:, -HISTORY_SIZE:]                      # (N, 3, D)
+            ctx_a = torch.cat(
+                [act_seq[:, -(HISTORY_SIZE - 1):], all_act_emb[:, h:h+1]], dim=1
+            )                                                        # (N, 3, D)
 
-        # CEM update from elites
+            pred     = model.predict(ctx_e, ctx_a)                  # (N, 3, D)
+            next_emb = pred[:, -1:]                                  # (N, 1, D)
+
+            emb_seq = torch.cat([emb_seq, next_emb], dim=1)         # (N, 3+h+1, D)
+            act_seq = torch.cat([act_seq, all_act_emb[:, h:h+1]], dim=1)  # (N, 2+h+1, D)
+
+        # ── 4. Cost at final predicted embedding ─────────────────────────────
+        final_emb = emb_seq[:, -1:]                                 # (N, 1, D)
+        costs = F.mse_loss(final_emb, goal_exp.detach(), reduction="none") \
+                  .sum(dim=-1).squeeze(-1)                          # (N,)
+
+        # ── 5. CEM update ────────────────────────────────────────────────────
         elite_idx   = costs.argsort()[:n_elites]
-        elites_norm = cands_norm[elite_idx]
-        mu    = elites_norm.mean(0)
+        elites_norm = cands_norm[elite_idx]                         # (E, H, 35)
+        mu    = elites_norm.mean(0)                                  # (H, 35)
         sigma = elites_norm.std(0).clamp(min=0.01)
 
-    # Final action: denormalise + L1-project
-    action_raw_t  = mu * _DELTA_STD + _DELTA_MEAN                 # (35,)
-    action_raw_t  = _project_l1_per_substep(action_raw_t.unsqueeze(0), l1_radius).squeeze(0)
-    action_norm_t = (action_raw_t - _DELTA_MEAN) / _DELTA_STD     # (35,) normalised
+    # Return first-step action (denormalised + projected)
+    first_raw  = (mu[0] * _DELTA_STD + _DELTA_MEAN)
+    first_raw  = _project_l1_per_substep(first_raw.unsqueeze(0), l1_radius).squeeze(0)
+    first_norm = (first_raw - _DELTA_MEAN) / _DELTA_STD
 
-    return action_norm_t.cpu().numpy(), action_raw_t.cpu().numpy()
+    return first_norm.cpu().numpy(), first_raw.cpu().numpy()
 
 
 # ── API ────────────────────────────────────────────────────────────────────────
@@ -236,6 +253,7 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--horizon",   type=int,   default=4)
     parser.add_argument("--n_samples", type=int,   default=800)
     parser.add_argument("--n_elites",  type=int,   default=64)
     parser.add_argument("--n_iters",   type=int,   default=10)
