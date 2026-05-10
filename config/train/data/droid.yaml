@@ -7,7 +7,8 @@ dataset:
     - wrist_image_left
   num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
   frameskip: 5         # obs at 3Hz; action block = 5 actions concat → predict 333ms ahead
-  clip_stride: 1       # JPEG random access is fast — use all clips
+  clip_stride: 5       # = frameskip: advance one obs step per clip, no redundant overlap
+  delta_action: true   # 7D Δ(cartesian+gripper), one delta per obs step (no action block)
   max_episodes: null   # null = all 57K episodes; set to small int for smoke tests
   keys_to_load:
     - pixels_0

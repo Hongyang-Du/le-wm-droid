@@ -152,6 +152,7 @@ def run(cfg):
         keys_to_load=list(cfg.data.dataset.keys_to_load),
         camera_keys=list(cfg.data.dataset.camera_keys),
         clip_stride=cfg.data.dataset.clip_stride,
+        delta_action=cfg.data.dataset.get("delta_action", False),
         max_episodes=n_ep,
         transform=full_transform,
     )
@@ -193,7 +194,8 @@ def run(cfg):
 
     hidden_dim = encoder.config.hidden_size
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
-    effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
+    # delta_action=True → 7D per step; else action block = frameskip × 28
+    effective_act_dim = proto.get_dim("action")
 
     camera_keys = cfg.data.dataset.get("camera_keys", None)
     n_views = len(camera_keys) if camera_keys else 1

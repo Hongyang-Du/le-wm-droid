@@ -372,13 +372,20 @@ class DroidStreamDataset(torch.utils.data.IterableDataset):
 class DroidJpegDataset(torch.utils.data.Dataset):
     """Map-style dataset using pre-extracted JPEG frames.
 
-    Each __getitem__ loads only the 4 observation frames needed per clip
-    (T×3 cameras = 12 JPEGs) — no full video decode, true random access.
-    Enable with frames_root pointing to the extracted directory.
+    Each __getitem__ loads only the T observation frames per camera
+    (T × N_cams JPEGs) — true random access, no full video decode.
+
+    delta_action=True: action = 7D Δ(cartesian+gripper) between consecutive
+    observation frames, matching V-JEPA 2-AC's action representation.
     """
 
-    ACTION_DIM = 28
-    STATE_DIM  = 14
+    DELTA_ACTION_DIM = 7   # Δcartesian(6) + Δgripper(1)
+    ACTION_DIM       = 28
+    STATE_DIM        = 14
+
+    # Pre-computed delta action stats (from 244K samples across 5 chunks)
+    _DELTA_MEAN = [ 0.0035, -0.0001, -0.0033,  0.0081, -0.0022, -0.0018,  0.005]
+    _DELTA_STD  = [ 0.019,   0.0242,  0.0261,  1.5526,  0.0588,  0.1768,  0.112]
 
     def __init__(
         self,
@@ -391,15 +398,17 @@ class DroidJpegDataset(torch.utils.data.Dataset):
         camera_keys: list[str] | None = None,
         max_episodes: int | None = None,
         clip_stride: int = 1,
+        delta_action: bool = True,
         parquet_cache_size: int = 1024,
     ) -> None:
-        self.root        = Path(root)
-        self.frames_root = Path(frames_root)
-        self.frameskip   = frameskip
-        self.num_steps   = num_steps
-        self.transform   = transform
-        self.span        = num_steps * frameskip
-        self.camera_keys = camera_keys or ["exterior_image_1_left"]
+        self.root         = Path(root)
+        self.frames_root  = Path(frames_root)
+        self.frameskip    = frameskip
+        self.num_steps    = num_steps
+        self.transform    = transform
+        self.span         = num_steps * frameskip
+        self.delta_action = delta_action
+        self.camera_keys  = camera_keys or ["exterior_image_1_left"]
         n_cams = len(self.camera_keys)
         default_pixel_keys = ["pixels"] if n_cams == 1 else [f"pixels_{i}" for i in range(n_cams)]
         self._keys = keys_to_load or (default_pixel_keys + ["action", "proprio"])
@@ -421,6 +430,7 @@ class DroidJpegDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> dict:
         ep_idx, start = self.clip_indices[idx]
         ep_abs  = self._episode_abs_indices[ep_idx]
+        ep_len  = int(self.lengths[ep_idx])
         obs_idx = list(range(start, start + self.span, self.frameskip))
         result: dict = {}
 
@@ -437,17 +447,33 @@ class DroidJpegDataset(torch.utils.data.Dataset):
             ])  # (T, C, H, W) uint8
 
         df = self._get_parquet(ep_idx, ep_abs)
+        states = np.stack(df["observation.state"].tolist()).astype(np.float32)  # (L, 14)
+
         if "action" in self._keys:
-            actions = np.stack(df["action"].iloc[start:start+self.span].tolist()).astype(np.float32)
-            result["action"] = torch.from_numpy(actions)
+            if self.delta_action:
+                # Action block: frameskip consecutive 7D deltas per obs step
+                # obs step i → raw frames [fi, fi+1, ..., fi+frameskip]
+                # block = [Δ(fi→fi+1), Δ(fi+1→fi+2), ..., Δ(fi+fs-1→fi+fs)]  (fs×7)
+                blocks = []
+                for fi in obs_idx:
+                    step_deltas = []
+                    for k in range(self.frameskip):
+                        t0 = min(fi + k,     ep_len - 1)
+                        t1 = min(fi + k + 1, ep_len - 1)
+                        step_deltas.append(states[t1, :7] - states[t0, :7])
+                    blocks.append(np.concatenate(step_deltas))   # (frameskip*7,)
+                result["action"] = torch.from_numpy(np.stack(blocks))  # (T, fs*7)
+            else:
+                actions = np.stack(df["action"].iloc[start:start+self.span].tolist()).astype(np.float32)
+                result["action"] = torch.from_numpy(actions)  # (span, 28), reshaped below
+
         if "proprio" in self._keys:
-            states = np.stack(df["observation.state"].iloc[obs_idx].tolist()).astype(np.float32)
-            result["proprio"] = torch.from_numpy(states)
+            result["proprio"] = torch.from_numpy(states[obs_idx])  # (T, 14)
 
         if self.transform:
             result = self.transform(result)
 
-        if "action" in result:
+        if "action" in result and not self.delta_action:
             result["action"] = result["action"].reshape(self.num_steps, -1)
 
         return result
@@ -456,13 +482,22 @@ class DroidJpegDataset(torch.utils.data.Dataset):
         if ep_idx not in self._parquet_cache:
             if len(self._parquet_cache) >= self._parquet_cache_size:
                 self._parquet_cache.popitem(last=False)
-            self._parquet_cache[ep_idx] = _load_parquet(_parquet_path(self.root, ep_abs))
+            self._parquet_cache[ep_idx] = pd.read_parquet(
+                _parquet_path(self.root, ep_abs),
+                columns=["action", "observation.state"],
+            )
         return self._parquet_cache[ep_idx]
 
     def get_dim(self, col: str) -> int:
-        return {"action": self.ACTION_DIM, "proprio": self.STATE_DIM}.get(col, 0)
+        if col == "action":
+            return (self.frameskip * self.DELTA_ACTION_DIM) if self.delta_action else self.ACTION_DIM
+        return {"proprio": self.STATE_DIM}.get(col, 0)
 
     def get_norm_stats(self, col: str) -> tuple[torch.Tensor, torch.Tensor]:
+        if col == "action" and self.delta_action:
+            mean = torch.tensor(self._DELTA_MEAN * self.frameskip, dtype=torch.float32)
+            std  = torch.tensor(self._DELTA_STD  * self.frameskip, dtype=torch.float32).clamp(min=1e-4)
+            return mean, std
         key_map = {"action": "action", "proprio": "observation.state"}
         stats_key = key_map.get(col, col)
         mean = torch.tensor(self._stats[stats_key]["mean"], dtype=torch.float32)
