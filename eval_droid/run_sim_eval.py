@@ -25,39 +25,57 @@ import json
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from eval_droid.sim_env import DroidSimEnv, make_env, TASKS
-from eval_droid.client_example import encode_image, reset_episode, get_action
+from eval_droid.client_example import reset_episode, get_action
+
+VIDEO_FPS = 15   # 3Hz obs × 5 sub-steps
+
+
+def _make_video_writer(path: Path, h: int, w: int) -> cv2.VideoWriter:
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    return cv2.VideoWriter(str(path), fourcc, VIDEO_FPS, (w, h))
 
 
 # ── eval loop ─────────────────────────────────────────────────────────────────
 
 def run_episode(
-    env:        DroidSimEnv,
-    server:     str,
-    task:       str,
-    max_steps:  int,
-    frameskip:  int,
-    verbose:    bool,
+    env:       DroidSimEnv,
+    server:    str,
+    max_steps: int,
+    video_dir: Path | None,
+    ep_idx:    int,
+    verbose:   bool,
 ) -> dict:
     """Run one episode. Returns dict with success, steps, total_time."""
 
-    # ── 1. Move to goal state and capture goal images ──────────────────────────
+    # ── 1. Move to goal state, capture goal images ─────────────────────────────
     env.reset()
     t0 = time.time()
     goal_imgs = env.generate_goal_images()
 
-    # ── 2. Reset environment to initial state ──────────────────────────────────
+    # ── 2. Reset to start state ────────────────────────────────────────────────
     obs = env.reset()
 
-    # ── 3. Send goal images to policy server ──────────────────────────────────
+    # ── 3. Send goal to policy server ─────────────────────────────────────────
     reset_episode(server, goal_imgs)
 
-    # ── 4. MPC eval loop ──────────────────────────────────────────────────────
+    # ── 4. Set up video writer (front-view camera, pixels_0) ──────────────────
+    writer = None
+    if video_dir is not None:
+        h, w = obs["pixels_0"].shape[:2]
+        video_path = video_dir / f"ep{ep_idx:03d}.mp4"
+        writer = _make_video_writer(video_path, h, w)
+        # Write goal image as first 15 frames so viewer knows the target
+        goal_bgr = cv2.cvtColor(goal_imgs["pixels_0"], cv2.COLOR_RGB2BGR)
+        for _ in range(15):
+            writer.write(goal_bgr)
+
+    # ── 5. MPC eval loop ───────────────────────────────────────────────────────
     success = False
     for step in range(max_steps):
-        # Policy server expects dict with pixels_0/1/2 keys
         images = {k: obs[k] for k in ["pixels_0", "pixels_1", "pixels_2"]}
         proprio = obs["proprio"].tolist()
 
@@ -65,11 +83,12 @@ def run_episode(
         action, action_block = get_action(server, images, proprio)
         latency_ms = (time.time() - t_act) * 1000
 
-        # Execute action block at frameskip=5 sub-steps
-        # action_block: [[7D], [7D], [7D], [7D], [7D]]
         done = False
         for sub_action in action_block:
             obs, reward, done, info = env.step(np.array(sub_action))
+            if writer is not None:
+                frame_bgr = cv2.cvtColor(obs["pixels_0"], cv2.COLOR_RGB2BGR)
+                writer.write(frame_bgr)
             if env.success():
                 success = True
                 done = True
@@ -77,17 +96,26 @@ def run_episode(
                 break
 
         if verbose:
-            print(f"  step {step:3d}  action={[f'{a:.3f}' for a in action]}"
-                  f"  latency={latency_ms:.0f}ms  success={success}")
+            print(f"  step {step:3d}  latency={latency_ms:.0f}ms  success={success}")
 
         if done or success:
             break
+
+    if writer is not None:
+        writer.release()
 
     total_time = time.time() - t0
     return {"success": success, "steps": step + 1, "total_time": total_time}
 
 
 def run_eval(args):
+    out_dir = Path(args.output_dir) / f"{args.task}_{int(time.time())}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    video_dir = out_dir / "videos" if args.save_video else None
+    if video_dir is not None:
+        video_dir.mkdir()
+
     env = make_env(
         task=args.task,
         has_renderer=not args.headless,
@@ -100,34 +128,32 @@ def run_eval(args):
         result = run_episode(
             env=env,
             server=args.server,
-            task=args.task,
             max_steps=args.max_steps,
-            frameskip=5,
+            video_dir=video_dir,
+            ep_idx=ep,
             verbose=args.verbose,
         )
         results.append(result)
-        print(f"  → success={result['success']}  steps={result['steps']}"
-              f"  time={result['total_time']:.1f}s")
+        status = "✓ SUCCESS" if result["success"] else "✗ fail"
+        print(f"  → {status}  steps={result['steps']}  time={result['total_time']:.1f}s")
 
     env.close()
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    n_success = sum(r["success"] for r in results)
+    n_success  = sum(r["success"] for r in results)
     success_rate = n_success / len(results) * 100
-    avg_steps = np.mean([r["steps"] for r in results])
+    avg_steps  = np.mean([r["steps"] for r in results])
 
     print(f"\n{'='*50}")
     print(f"Task:         {args.task}")
     print(f"Episodes:     {args.episodes}")
     print(f"Success rate: {n_success}/{args.episodes} = {success_rate:.1f}%")
     print(f"Avg steps:    {avg_steps:.1f}")
+    if video_dir:
+        print(f"Videos:       {video_dir}/")
     print(f"{'='*50}")
 
-    # Save results
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"results_{args.task}_{int(time.time())}.json"
-    with open(out_path, "w") as f:
+    with open(out_dir / "results.json", "w") as f:
         json.dump({
             "task": args.task,
             "episodes": args.episodes,
@@ -135,7 +161,7 @@ def run_eval(args):
             "avg_steps": float(avg_steps),
             "per_episode": results,
         }, f, indent=2)
-    print(f"Results saved to {out_path}")
+    print(f"Results saved to {out_dir}/results.json")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -145,11 +171,12 @@ if __name__ == "__main__":
     parser.add_argument("--task",       default="reach",
                         choices=["reach", "lift", "pick_place"],
                         help="difficulty: reach < lift < pick_place")
-    parser.add_argument("--server",     default="http://localhost:8000",
-                        help="Policy server URL")
-    parser.add_argument("--episodes",   type=int, default=50)
-    parser.add_argument("--max_steps",  type=int, default=100,
+    parser.add_argument("--server",     default="http://localhost:8000")
+    parser.add_argument("--episodes",   type=int,  default=50)
+    parser.add_argument("--max_steps",  type=int,  default=100,
                         help="Max obs-steps per episode (each = 5 sub-steps)")
+    parser.add_argument("--save_video", action="store_true", default=True,
+                        help="Save MP4 per episode (front-view camera)")
     parser.add_argument("--headless",   action="store_true", default=True)
     parser.add_argument("--verbose",    action="store_true", default=False)
     parser.add_argument("--output_dir", default="eval_results")
