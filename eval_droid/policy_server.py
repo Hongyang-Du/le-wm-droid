@@ -102,54 +102,79 @@ def _build_ctx_act_norm() -> torch.Tensor:
     return torch.stack(hist, dim=1)      # (1, 2, 35)
 
 
+def _project_l1_per_substep(action_raw: torch.Tensor, radius: float = 0.075) -> torch.Tensor:
+    """
+    Project each 7D sub-action onto the L1-ball of given radius.
+    Matches V-JEPA 2 AC constraint (≈7.5cm max end-effector displacement per sub-step).
+    action_raw: (N, 35) raw denormalised actions
+    returns:    (N, 35) projected
+    """
+    x = action_raw.view(-1, FRAMESKIP, 7)           # (N, 5, 7)
+    l1 = x.abs().sum(dim=-1, keepdim=True)          # (N, 5, 1)
+    scale = (radius / l1.clamp(min=radius))         # clamp: no-op when already inside ball
+    return (x * scale).view(-1, ACTION_DIM)         # (N, 35)
+
+
 @torch.no_grad()
 def _cem_plan(
     ctx_emb:    torch.Tensor,   # (1, 3, D)
     past_act:   torch.Tensor,   # (1, 2, 35) normalised
     goal_emb:   torch.Tensor,   # (1, 1, D)
-    n_samples:  int = 300,
-    n_elites:   int = 10,
-    n_iters:    int = 5,
+    n_samples:  int = 800,
+    n_elites:   int = 64,
+    n_iters:    int = 10,
+    l1_radius:  float = 0.075,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
+    CEM planner matching V-JEPA 2 AC settings:
+      800 samples, 10 iterations, L1-ball constraint r=0.075 per sub-step.
+
     Returns:
         action_norm (35,) – normalised action (for storing in history)
-        action_raw  (35,) – denormalised deltas to send to robot
+        action_raw  (35,) – L1-projected denormalised deltas to send to robot
     """
     mu    = torch.zeros(ACTION_DIM, device=device)
     sigma = torch.ones(ACTION_DIM, device=device)
 
     goal_exp = goal_emb.expand(n_samples, -1, -1)   # (N, 1, D)
+    # Pre-encode past actions once (same for all candidates)
+    past_emb = model.action_encoder(past_act.expand(n_samples, -1, -1))  # (N, 2, D)
 
     for _ in range(n_iters):
-        # (N, 35) candidate actions in normalised space
-        cands = mu + sigma * torch.randn(n_samples, ACTION_DIM, device=device)
+        # Sample (N, 35) in normalised space, then denormalise + L1-project
+        cands_norm = mu + sigma * torch.randn(n_samples, ACTION_DIM, device=device)
+        cands_raw  = cands_norm * _DELTA_STD + _DELTA_MEAN        # (N, 35) raw
+        cands_raw  = _project_l1_per_substep(cands_raw, l1_radius)
+        # Re-normalise projected raw actions so action_encoder sees consistent input
+        cands_norm = (cands_raw - _DELTA_MEAN) / _DELTA_STD       # (N, 35) normalised
 
-        # Encode candidate actions:  (N, 1, 35) → (N, 1, D)
-        cand_emb = model.action_encoder(cands.unsqueeze(1))   # (N, 1, D)
+        # Encode candidate actions: (N, 1, 35) → (N, 1, D)
+        cand_emb = model.action_encoder(cands_norm.unsqueeze(1))   # (N, 1, D)
 
-        # Build full action context [a_{t-2}, a_{t-1}, a_candidate]: (N, 3, D)
-        past_emb = model.action_encoder(past_act.expand(n_samples, -1, -1))  # (N, 2, D)
-        ctx_act  = torch.cat([past_emb, cand_emb], dim=1)                    # (N, 3, D)
+        # Full action context [a_{t-2}, a_{t-1}, a_candidate]: (N, 3, D)
+        ctx_act  = torch.cat([past_emb, cand_emb], dim=1)         # (N, 3, D)
 
         # Predict next embedding
-        ctx_exp  = ctx_emb.expand(n_samples, -1, -1)   # (N, 3, D)
-        pred     = model.predict(ctx_exp, ctx_act)      # (N, 3, D)
-        next_emb = pred[:, -1:]                         # (N, 1, D)
+        ctx_exp  = ctx_emb.expand(n_samples, -1, -1)              # (N, 3, D)
+        pred     = model.predict(ctx_exp, ctx_act)                 # (N, 3, D)
+        next_emb = pred[:, -1:]                                    # (N, 1, D)
 
-        # Cost = MSE to goal
+        # Cost = MSE to goal embedding
         costs = F.mse_loss(next_emb, goal_exp.detach(), reduction="none") \
-                  .sum(dim=-1).squeeze(-1)              # (N,)
+                  .sum(dim=-1).squeeze(-1)                         # (N,)
 
-        # CEM update
-        elite_idx = costs.argsort()[:n_elites]
-        elites    = cands[elite_idx]
-        mu        = elites.mean(0)
-        sigma     = elites.std(0).clamp(min=0.01)
+        # CEM update from elites
+        elite_idx   = costs.argsort()[:n_elites]
+        elites_norm = cands_norm[elite_idx]
+        mu    = elites_norm.mean(0)
+        sigma = elites_norm.std(0).clamp(min=0.01)
 
-    action_norm = mu.cpu().numpy()
-    action_raw  = (mu * _DELTA_STD.to(device) + _DELTA_MEAN.to(device)).cpu().numpy()
-    return action_norm, action_raw
+    # Final action: denormalise + L1-project
+    action_raw_t  = mu * _DELTA_STD + _DELTA_MEAN                 # (35,)
+    action_raw_t  = _project_l1_per_substep(action_raw_t.unsqueeze(0), l1_radius).squeeze(0)
+    action_norm_t = (action_raw_t - _DELTA_MEAN) / _DELTA_STD     # (35,) normalised
+
+    return action_norm_t.cpu().numpy(), action_raw_t.cpu().numpy()
 
 
 # ── API ────────────────────────────────────────────────────────────────────────
@@ -211,9 +236,10 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--n_samples", type=int, default=300)
-    parser.add_argument("--n_elites",  type=int, default=10)
-    parser.add_argument("--n_iters",   type=int, default=5)
+    parser.add_argument("--n_samples", type=int,   default=800)
+    parser.add_argument("--n_elites",  type=int,   default=64)
+    parser.add_argument("--n_iters",   type=int,   default=10)
+    parser.add_argument("--l1_radius", type=float, default=0.075)
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
