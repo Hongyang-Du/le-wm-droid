@@ -14,3 +14,4 @@ wandb/
 *.tar
 *.json
 eval_results/
+*.deb
