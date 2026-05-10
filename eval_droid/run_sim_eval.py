@@ -2,21 +2,20 @@
 Goal-image MPC sim evaluation for LeWM DROID.
 Mirrors V-JEPA 2 AC evaluation protocol in robosuite.
 
-Usage (policy server must be running on this machine):
+Difficulty ladder:
+  reach      → EEF reaches within 5cm of object  (easiest, start here)
+  lift       → grasp + lift 15cm
+  pick_place → lift + move to target bin          (hardest)
+
+Usage:
     # Terminal 1 – policy server:
     cd /workspace/le-wm-droid
-    python -m eval_droid.policy_server \
+    python -m eval_droid.policy_server \\
         --ckpt /root/.stable_worldmodel/lewm_droid_epoch_10_object.ckpt
 
-    # Terminal 2 – sim eval:
-    python -m eval_droid.run_sim_eval \
-        --task Lift --episodes 50 --server http://localhost:8000
-
-Goal image protocol (same as V-JEPA 2 AC):
-    1. At episode start, run scripted policy to goal state → capture goal images
-    2. Reset environment to start state
-    3. Run MPC policy (POST /reset with goal images, then POST /act per step)
-    4. Episode succeeds if task reward is positive within max_steps
+    # Terminal 2 – sim eval (start with reach):
+    python -m eval_droid.run_sim_eval --task reach --episodes 50
+    python -m eval_droid.run_sim_eval --task lift  --episodes 50
 """
 
 from __future__ import annotations
@@ -28,24 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
-from eval_droid.sim_env import DroidSimEnv, make_env
+from eval_droid.sim_env import DroidSimEnv, make_env, TASKS
 from eval_droid.client_example import encode_image, reset_episode, get_action
-
-
-# ── scripted goal generators per task ─────────────────────────────────────────
-
-def get_goal_images(env: DroidSimEnv, task: str) -> dict[str, np.ndarray]:
-    """
-    Generate goal images by running a scripted policy to the goal state.
-    Then the caller resets the env before running the MPC policy.
-    """
-    if task == "Lift":
-        return env.generate_goal_state_lift(lift_height=0.15)
-    else:
-        # For other tasks: just capture the current (reset) state as a
-        # placeholder — replace with task-specific scripted goal generators.
-        raise NotImplementedError(f"Goal generator not implemented for task={task}. "
-                                   "Add one in sim_env.py or provide goal images manually.")
 
 
 # ── eval loop ─────────────────────────────────────────────────────────────────
@@ -63,7 +46,7 @@ def run_episode(
     # ── 1. Move to goal state and capture goal images ──────────────────────────
     env.reset()
     t0 = time.time()
-    goal_imgs = get_goal_images(env, task)
+    goal_imgs = env.generate_goal_images()
 
     # ── 2. Reset environment to initial state ──────────────────────────────────
     obs = env.reset()
@@ -106,9 +89,9 @@ def run_episode(
 
 def run_eval(args):
     env = make_env(
-        task_name=args.task,
+        task=args.task,
         has_renderer=not args.headless,
-        horizon=args.max_steps * 5 + 50,   # enough for frameskip sub-steps
+        horizon=args.max_steps * 5 + 50,
     )
 
     results = []
@@ -159,9 +142,9 @@ def run_eval(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task",       default="Lift",
-                        choices=["Lift", "PickPlace", "Stack"],
-                        help="robosuite task name")
+    parser.add_argument("--task",       default="reach",
+                        choices=["reach", "lift", "pick_place"],
+                        help="difficulty: reach < lift < pick_place")
     parser.add_argument("--server",     default="http://localhost:8000",
                         help="Policy server URL")
     parser.add_argument("--episodes",   type=int, default=50)

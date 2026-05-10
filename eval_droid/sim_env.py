@@ -3,6 +3,11 @@ robosuite environment wrapper for LeWM DROID goal-image MPC evaluation.
 
 Franka robot + OSC_POSE (7D Cartesian delta) + 3 cameras matching DROID layout.
 Goal image: step to goal state, capture images, reset to start state.
+
+Difficulty ladder (same as V-JEPA 2 AC):
+  reach  → EEF reaches within 5cm of object (no grasp needed)
+  lift   → grasp + lift object 15cm above table
+  pick_place → lift + move to target zone
 """
 
 from __future__ import annotations
@@ -12,21 +17,30 @@ import robosuite as suite
 from robosuite.controllers import load_controller_config
 
 # Camera names used in this sim (mapped to DROID camera key names)
-CAM_SIM  = ["frontview", "sideview", "robot0_eye_in_hand"]  # robosuite names
-CAM_DROID = ["pixels_0",  "pixels_1",  "pixels_2"]          # keys sent to policy server
+CAM_SIM   = ["frontview", "sideview", "robot0_eye_in_hand"]  # robosuite names
+CAM_DROID = ["pixels_0",  "pixels_1",  "pixels_2"]           # keys sent to policy server
 
 IMG_H, IMG_W = 240, 320   # raw capture resolution (policy server resizes to 224×224)
 
+# Difficulty ladder
+TASKS = {
+    "reach":      "Lift",        # robosuite env; success = EEF within 5cm of object
+    "lift":       "Lift",        # success = object lifted 15cm
+    "pick_place": "PickPlace",   # success = object in target bin
+}
+REACH_THRESHOLD = 0.05   # metres
+
 
 def make_env(
-    task_name: str = "Lift",       # "Lift", "PickPlace", "Stack"
+    task: str = "reach",
     camera_height: int = IMG_H,
     camera_width:  int = IMG_W,
     has_renderer:  bool = False,
     horizon:       int  = 300,
 ) -> "DroidSimEnv":
+    assert task in TASKS, f"task must be one of {list(TASKS)}"
     return DroidSimEnv(
-        task_name=task_name,
+        task=task,
         camera_height=camera_height,
         camera_width=camera_width,
         has_renderer=has_renderer,
@@ -41,27 +55,29 @@ class DroidSimEnv:
       - 3 cameras (front, side, wrist) → same keys as DROID dataset
       - goal_image capture: step env to goal state, record cameras, reset
 
-    Action space: 7D = [Δx, Δy, Δz, Δrx, Δry, Δrz, gripper_open]
-      - Δpos in meters (scale ≈ 0.05m max per step at 3Hz)
-      - Δrot in radians
+    task options: "reach", "lift", "pick_place"
+
+    Action space: 7D = [Δx, Δy, Δz, Δrx, Δry, Δrz, gripper]
+      - Δpos in metres, Δrot in radians
       - gripper: -1 = close, +1 = open
     """
 
     def __init__(
         self,
-        task_name:     str  = "Lift",
+        task:          str  = "reach",
         camera_height: int  = IMG_H,
         camera_width:  int  = IMG_W,
         has_renderer:  bool = False,
         horizon:       int  = 300,
     ):
+        self.task = task
         controller_cfg = load_controller_config(default_controller="OSC_POSE")
-        # Scale down position/rotation sensitivity to match DROID L1 ≤ 0.075 constraint
+        # Match DROID L1 ≤ 0.075 constraint per sub-step
         controller_cfg["output_max"] = [0.075] * 3 + [0.075] * 3
         controller_cfg["output_min"] = [-0.075] * 3 + [-0.075] * 3
 
         self._env = suite.make(
-            env_name=task_name,
+            env_name=TASKS[task],
             robots="Franka",
             controller_configs=controller_cfg,
             has_renderer=has_renderer,
@@ -75,7 +91,6 @@ class DroidSimEnv:
             ignore_done=False,
         )
 
-        self.task_name = task_name
         self._goal_images: dict[str, np.ndarray] | None = None
 
     # ── core interface ─────────────────────────────────────────────────────────
@@ -95,7 +110,17 @@ class DroidSimEnv:
         return obs, float(reward), bool(done), info
 
     def success(self) -> bool:
-        return bool(self._env._check_success())
+        """Task-specific success criterion."""
+        if self.task == "reach":
+            # Success = EEF within REACH_THRESHOLD of object (no grasp needed)
+            obj_pos = self._env.sim.data.body_xpos[
+                self._env.sim.model.body_name2id("cube_main")
+            ]
+            eef_pos = self._env._eef_xpos
+            return float(np.linalg.norm(obj_pos - eef_pos)) < REACH_THRESHOLD
+        else:
+            # lift / pick_place: use robosuite's built-in check
+            return bool(self._env._check_success())
 
     # ── goal image ─────────────────────────────────────────────────────────────
 
@@ -133,44 +158,66 @@ class DroidSimEnv:
             raw.get("robot0_joint_vel", np.zeros(7)),
         ]).astype(np.float32)
 
-    # ── task-specific goal state generators ───────────────────────────────────
+    # ── goal state generators (scripted) ──────────────────────────────────────
 
-    def generate_goal_state_lift(self, lift_height: float = 0.15) -> dict[str, np.ndarray]:
+    def generate_goal_images(self) -> dict[str, np.ndarray]:
         """
-        For Lift task: run a scripted lift to height, capture goal images.
-        Object must already be grasped or we use the object's target pos directly.
+        Run scripted policy to goal state for current task, capture images.
+        Caller should reset() before running the MPC policy afterwards.
         """
-        # Move end-effector above object position
+        if self.task == "reach":
+            return self._goal_reach()
+        elif self.task == "lift":
+            return self._goal_lift()
+        elif self.task == "pick_place":
+            return self._goal_lift()   # lift part is sufficient for goal image
+        else:
+            raise NotImplementedError(self.task)
+
+    def _goal_reach(self) -> dict[str, np.ndarray]:
+        """Goal: EEF touching/at the object. Simple reach, no grasp."""
         obj_pos = self._env.sim.data.body_xpos[
             self._env.sim.model.body_name2id("cube_main")
         ].copy()
 
-        # Open gripper, move above object, close, lift
-        actions = []
-        # 1. open gripper, move above
+        # Move EEF to object position (open gripper, approach from above, descend)
+        for _ in range(15):
+            delta = obj_pos - self._env._eef_xpos
+            delta[2] += 0.08
+            a = np.zeros(7); a[:3] = np.clip(delta * 8, -0.075, 0.075); a[6] = 1.0
+            self._env.step(a)
         for _ in range(10):
             delta = obj_pos - self._env._eef_xpos
-            delta[2] += 0.10   # approach from above
-            a = np.zeros(7); a[:3] = np.clip(delta * 5, -0.075, 0.075); a[6] = 1.0
-            actions.append(a)
-        # 2. descend
-        for _ in range(8):
-            delta = obj_pos - self._env._eef_xpos
-            a = np.zeros(7); a[:3] = np.clip(delta * 5, -0.075, 0.075); a[6] = 1.0
-            actions.append(a)
-        # 3. close gripper
-        for _ in range(5):
-            a = np.zeros(7); a[6] = -1.0
-            actions.append(a)
-        # 4. lift
-        for _ in range(12):
-            a = np.zeros(7); a[2] = 0.05; a[6] = -1.0
-            actions.append(a)
+            a = np.zeros(7); a[:3] = np.clip(delta * 8, -0.075, 0.075); a[6] = 1.0
+            self._env.step(a)
 
-        for a in actions:
-            raw, _, done, _ = self._env.step(a)
-            if done:
-                break
+        return self.capture_goal_images()
+
+    def _goal_lift(self, lift_height: float = 0.15) -> dict[str, np.ndarray]:
+        """Goal: object grasped and lifted lift_height above table."""
+        obj_pos = self._env.sim.data.body_xpos[
+            self._env.sim.model.body_name2id("cube_main")
+        ].copy()
+
+        # 1. Open gripper, approach from above
+        for _ in range(12):
+            delta = obj_pos - self._env._eef_xpos
+            delta[2] += 0.10
+            a = np.zeros(7); a[:3] = np.clip(delta * 6, -0.075, 0.075); a[6] = 1.0
+            self._env.step(a)
+        # 2. Descend to object
+        for _ in range(10):
+            delta = obj_pos - self._env._eef_xpos
+            a = np.zeros(7); a[:3] = np.clip(delta * 6, -0.075, 0.075); a[6] = 1.0
+            self._env.step(a)
+        # 3. Close gripper
+        for _ in range(8):
+            a = np.zeros(7); a[6] = -1.0
+            self._env.step(a)
+        # 4. Lift
+        for _ in range(15):
+            a = np.zeros(7); a[2] = 0.05; a[6] = -1.0
+            self._env.step(a)
 
         return self.capture_goal_images()
 
