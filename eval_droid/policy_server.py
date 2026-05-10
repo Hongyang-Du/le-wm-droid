@@ -266,6 +266,29 @@ def main():
 
     print(f"Loading checkpoint: {args.ckpt}")
     model = torch.load(args.ckpt, map_location=device, weights_only=False)
+
+    # Fix transformers version mismatch: rebuild ViTConfig from saved arch params.
+    # Newer transformers added/renamed many attributes; safest fix is a fresh config.
+    from transformers import ViTConfig
+    old = model.encoder.config
+    new_cfg = ViTConfig(
+        hidden_size=old.hidden_size,
+        num_hidden_layers=old.num_hidden_layers,
+        num_attention_heads=old.num_attention_heads,
+        intermediate_size=old.intermediate_size,
+        hidden_act=old.hidden_act,
+        hidden_dropout_prob=old.hidden_dropout_prob,
+        attention_probs_dropout_prob=old.attention_probs_dropout_prob,
+        initializer_range=old.initializer_range,
+        layer_norm_eps=old.layer_norm_eps,
+        image_size=old.image_size,
+        patch_size=old.patch_size,
+        num_channels=old.num_channels,
+        qkv_bias=old.qkv_bias,
+        encoder_stride=old.encoder_stride,
+    )
+    model.encoder.config = new_cfg
+
     model.eval()
     model.requires_grad_(False)
     print(f"Model loaded on {device}. Starting server at {args.host}:{args.port}")
